@@ -12,6 +12,7 @@ import edlib as ed
 import networkx as nx
 import pandas as pd
 import pysam
+import scipy
 from tqdm import tqdm
 
 def build_parser():
@@ -50,16 +51,15 @@ def get_index(x, a):
         return i
     return None
 
-def get_mutations(read, mutation_df):
+def get_mutations(read, mt_df):
     """
     Work out which mutations are relevant to
     """
 
     # A dictionary to keep track of whether each read can be assigned to a mutation
-    #bp_dict = {mutation:None for mutation in mutation_df['coord_hg38']}
-    bp_dict = {}
+    mt_status = {}
 
-    for index, row in mutation_df.iterrows():
+    for index, row in mt_df.iterrows():
         # Check that this read has actually been assigned to the gene
         if '|'+row['gene']+'|' not in read.qname:
             # No match, increment NA
@@ -67,28 +67,98 @@ def get_mutations(read, mutation_df):
             continue
 
         # Check for coverage 
-        mutation_chr = row['coord_hg38'].split(':')[0]
+        mutation_chr = row['mut2__hg38'].split(':')[0]
         if read.to_dict()['ref_name'] != mutation_chr:
             continue
         
-        full_reference_positions = read.get_reference_positions(full_length=True)
-        reference_positions = read.get_reference_positions(full_length=False)
-        mutation_position = int(row['coord_hg38'].split(':')[1])
-        target_idx = get_index(mutation_position, reference_positions)
+        full_ref_pos = read.get_reference_positions(full_length=True)
+        ref_pos = read.get_reference_positions(full_length=False)
+        mt_pos = int(row['mut2__hg38'].split(':')[1].split('_')[0])
+        mt_desc = row['mut2__hg38'].split('_')[1]
+        target_idx = get_index(mt_pos, ref_pos)
         if target_idx is None:
-            #bp_dict[row['coord_hg38']] = 'NC'
+            # No overlap, skip to next iteration
             continue
 
         # If we reach this point, match has been found, increment that BP
-        bp = read.get_forward_sequence()[full_reference_positions.index(mutation_position)]
-        bp_dict[row['coord_hg38']] = bp
+        mt_status[row['mut2__hg38']] = assign_mutation_status(\
+                sequence = read.get_forward_sequence(), \
+                positions = full_ref_pos, \
+                mt_pos = mt_pos, \
+                mt_desc = mt_desc)
 
-    return bp_dict
+    return mt_status
+
+def assign_mutation_status(sequence, positions, mt_pos, mt_desc, tol=0.05, err=0.1):
+    # NOTE, tol and err are used to allow for slight mismatches in longer insertion 
+    # sequences. The number of allowed mistmatches is calculated as
+    # scipy.stats.binom(1-tol, len(mt_str), err) where mt_str is the insertion 
+    # sequence (including the first, unchanged basepair)
+
+    wt_str, mt_str = mt_desc.split('>')
+    mt_status = None
+    
+    start_pos = positions.index(mt_pos)
+
+    if (len(wt_str)==1) and (len(mt_str)==1):
+        # SNP
+        # See if the observed read matches either of the "possibilities"
+        bp = sequence[start_pos]
+        return 'MT' if mt_str==bp else 'WT' if wt_str==bp else 'UN'
+
+    elif (len(wt_str)>1) and (mt_str==wt_str[0]):
+        # Deletion
+        # Search for a gap with the appropriate size
+        if len(positions)==(start_pos+1):
+            # Somehow this is the end of the read... tough luck
+            return 'UN'
+
+        if (positions[start_pos] is None) or (positions[start_pos+1] is None): 
+            # Not sure what really to do in the case ....
+            return 'UN'
+
+        gap = positions[start_pos+1] - positions[start_pos]
+        # If the gap is the same length as wt_str, then we have a deletion that matches
+        # If the gap is 1, there is no deletion
+        # Otherwise, we don't know
+        return 'MT' if gap==len(wt_str) else 'WT' if gap==1 else 'UN'
+
+    elif (len(mt_str)>1) and (wt_str==mt_str[0]):
+        # Insertion
+        # Check that the reference alignment is 'None' just after the target position 
+        # for the correct number of base pairs
+
+        if len(positions)==(start_pos+1):
+            # Somehow this is the end of the read... tough luck
+            return 'UN'
+
+        if positions[start_pos+1] is not None:
+            # No insertion found, assign WT and break
+            return 'WT'
+
+        if len(positions)<(start_pos+len(mut_str)):
+            # The read doesn't cover the length of the mutation
+            return 'UN'
+
+        # Check that the correct number of inserted base pairs is observed
+        for i in range(2, len(mut_str)):
+            if positions[start_pos+i] is not None:      
+                return 'UN'
+
+        # Finally, check that the sequence matches, within a given tolerence
+        max_ed = scipy.stats.binom.ppf(1-tol, len(mut_str), err)
+        obs_ed = ed.align(sequence[start_pos:(start_pos+len(mut_str))], mut_str)['editDistance']
+        # Return MT if it is within tolerence, otherwise Unknown ...
+        return 'UN' if ob_ed > max_ed else 'MT'
+    else:
+        # Unknown
+        raise(ValueError, "Unsupported mutation string: {}".format(mt_desc))
+    
+    return 'UN'
 
 
-
-def get_mutation_dict(fetch, header, mutation_df, quiet=False, cores=8):
-    mutation_dict = {}
+def get_mutation_dict(fetch, header, mt_df, quiet=False, cores=8):
+    mt_dict = {}
     idx_counter = 0
 
     # Put together an iterator over all of the reads
@@ -99,7 +169,7 @@ def get_mutation_dict(fetch, header, mutation_df, quiet=False, cores=8):
     read_list = [read.to_dict() for read in tqdm(fetch)]
     arg_iterator = zip(read_list, 
                        itertools.cycle([header.to_dict()]), 
-                       itertools.cycle([mutation_df]))
+                       itertools.cycle([mt_df]))
 
     # Send the iterator to imap to search the target mutation locations in each read
     if(not quiet):
@@ -108,27 +178,27 @@ def get_mutation_dict(fetch, header, mutation_df, quiet=False, cores=8):
     results = tqdm(pool.imap(_get_mutation_dict_iter, arg_iterator))
 
     # Sort the results into a dictionary grouping common cells and umi's
-    for cb, umi, bp_dict in results:
-        if cb not in mutation_dict:
-            mutation_dict[cb] = {}
-        if umi not in mutation_dict[cb]:
-            mutation_dict[cb][umi] = \
-                    {mutation:{'A':0, 'C':0, 'G':0, 'T':0}\
-                    for mutation in mutation_df['coord_hg38']}
+    for cb, umi, mt_status in results:
+        if cb not in mt_dict:
+            mt_dict[cb] = {}
+        if umi not in mt_dict[cb]:
+            mt_dict[cb][umi] = \
+                    {mutation:{'WT':0, 'MT':0, 'UN':0}\
+                    for mutation in mt_df['mut2__hg38']}
         # Add the current index to the list and increment counter
         idx_counter += 1 
-        for mutation in  bp_dict:
+        for mutation in mt_status:
             # Increment the findings for the unique barcode
-            mutation_dict[cb][umi][mutation][bp_dict[mutation]] += 1
+            mt_dict[cb][umi][mutation][mt_status[mutation]] += 1
 
     pool.close()
 
-    return mutation_dict
+    return mt_dict
 
 def _get_mutation_dict_iter(arg):
     read_dict = arg[0]
     header_dict = arg[1]
-    mutation_df = arg[2]
+    mt_df = arg[2]
     header = pysam.AlignmentHeader.from_dict(header_dict)
     read = pysam.AlignedSegment.from_dict(read_dict, header = header)
 
@@ -137,20 +207,20 @@ def _get_mutation_dict_iter(arg):
     cb = tags['CB']
     umi = tags['UB']
 
-    bp_dict = get_mutations(read, mutation_df)
+    mts_dict = get_mutations(read, mt_df)
 
-    return (cb, umi, bp_dict)
+    return (cb, umi, mts_dict)
 
-def cluster_mutation_dict_umis(mutation_dict, quiet=False):
+def cluster_mutation_dict_umis(mt_dict, quiet=False):
     """
     process the output of get_mutation_dict to cluster common UMI's together
     """ 
 
     if not quiet:
         print("Clustering UMIs ...")
-    for cb in tqdm(mutation_dict):
+    for cb in tqdm(mt_dict):
         # For each cell, grab the umi's and cluster them
-        umi_list = list(mutation_dict[cb])
+        umi_list = list(mt_dict[cb])
         umi_corrections = cluster_umis(umi_list)
         # Then, aggregate the totals within each cluster
         for umi in umi_list:
@@ -158,15 +228,15 @@ def cluster_mutation_dict_umis(mutation_dict, quiet=False):
             if umi == correction:
                 continue # No adjustment necessary .. continue
             # Otherwise, add this entry to the "correction" entry, and delete the original 
-            for mutation in mutation_dict[cb][umi]:
+            for mutation in mt_dict[cb][umi]:
                 # The mutation may not yet be recoreded in the target ..
                 # If this crashes, may need to adjust ...
-               for bp in mutation_dict[cb][correction][mutation]:
+               for mts in mt_dict[cb][correction][mutation]:
                     # Add the umi to the target correction
-                    mutation_dict[cb][correction][mutation][bp] += \
-                    mutation_dict[cb][umi][mutation][bp]
+                    mt_dict[cb][correction][mutation][mts] += \
+                    mt_dict[cb][umi][mutation][mts]
             # Remove the entry as it has been transfered over to the target correction
-            del mutation_dict[cb][umi] 
+            del mt_dict[cb][umi] 
  
 
     return None
@@ -204,25 +274,25 @@ def cluster_umis(umis):
         
     return umi_corrections
 
-def assign_umi_mutations(mutation_dict, quiet=False):
+def assign_umi_mutations(mt_dict, quiet=False):
     
     if not quiet:
         print("Assigning UMI mutations ...")
 
-    for cb in tqdm(mutation_dict):
-        for umi in mutation_dict[cb]:
-            # Find the maximal base pair for each mutation and max that assignment
-            for mutation in mutation_dict[cb][umi]:
-                max_bp = None
+    for cb in tqdm(mt_dict):
+        for umi in mt_dict[cb]:
+            # Find the maximal mutation type for each mutation and max that assignment
+            for mutation in mt_dict[cb][umi]:
+                max_mts = None
                 max_count = 0
-                for bp, count in mutation_dict[cb][umi][mutation].items():
-                    max_bp, max_count = (bp, count) if count > max_count else (max_bp, max_count)
+                for mts, count in mt_dict[cb][umi][mutation].items():
+                    max_mts, max_count = (mts, count) if count > max_count else (max_mts, max_count)
                 # Make the assignment
-                mutation_dict[cb][umi][mutation] = max_bp #(max_bp, max_count) 
+                mt_dict[cb][umi][mutation] = max_mts #(max_mts, max_count) 
 
     return None
 
-def get_cb_mutations(mutation_dict, quiet=False):
+def get_cb_mutations(mt_dict, quiet=False):
 
     cb_mutations = {}
     
@@ -230,36 +300,41 @@ def get_cb_mutations(mutation_dict, quiet=False):
     if not quiet:
         print("Assigning cell mutations ...")
 
-    for cb in tqdm(mutation_dict):
+    for cb in tqdm(mt_dict):
         cb_mutations[cb] = {'Total':0}
 
         # Go through each of the UMIs and tally up how many base pairs we see at each location
-        for umi in mutation_dict[cb]:
+        for umi in mt_dict[cb]:
             cb_mutations[cb]['Total'] += 1
             max_mutation = None
             max_count = 0
-            for mutation, bp in mutation_dict[cb][umi].items():
+            for mutation, mts in mt_dict[cb][umi].items():
                 if mutation not in cb_mutations[cb]:
                     cb_mutations[cb][mutation] = {}
-                if bp not in cb_mutations[cb][mutation]:
-                    cb_mutations[cb][mutation][bp] = 0
-                cb_mutations[cb][mutation][bp] += 1
+                if mts not in cb_mutations[cb][mutation]:
+                    cb_mutations[cb][mutation][mts] = 0
+                cb_mutations[cb][mutation][mts] += 1
 
         # Go back through and work out the most likely status for each possible mutation
         for mutation in cb_mutations[cb]:
             # One of these entries isn't a dictionary ...
             if mutation == 'Total':
                 continue
-            max_bp = None
-            max_count = 0
-            coverage = 0
-            for bp, count in cb_mutations[cb][mutation].items():
-                # Skip if bp is none ...
-                if bp is None:
-                    continue
-                max_bp, max_count = (bp, count) if count > max_count else (max_bp, max_count)
-                coverage += count
-            cb_mutations[cb][mutation] = (max_bp, max_count, coverage) 
+            #max_mts = None
+            #max_count = 0
+            #coverage = 0
+            #for mts, count in cb_mutations[cb][mutation].items():
+            #    # Skip if mts is none ...
+            #    if mts is None:
+            #        continue
+            #    max_mts, max_count = (mts, count) if count > max_count else (max_mts, max_count)
+            #    coverage += count
+
+            n_wt = cb_mutations[cb][mutation]['WT'] if 'WT' in cb_mutations[cb][mutation] else 0
+            n_mt = cb_mutations[cb][mutation]['MT'] if 'MT' in cb_mutations[cb][mutation] else 0
+            n_un = cb_mutations[cb][mutation]['UN'] if 'UN' in cb_mutations[cb][mutation] else 0
+
+            cb_mutations[cb][mutation] = (n_wt, n_mt, n_un)#(max_mts, max_count, coverage) 
 
     return cb_mutations
 
@@ -278,9 +353,13 @@ def write_cb_mutations_to_csv(cb_mutations, outfile, quiet=False):
             # One of these entries isn't a dictionary ...
             if mutation == 'Total':
                 continue
-            bp, count, coverage = cb_mutations[cb][mutation]
-            df_dict[cb][mutation+'_bp'] = bp
-            df_dict[cb][mutation+'_count'] = count
+
+            wt, mt, un = cb_mutations[cb][mutation]
+            coverage = wt + mt + un
+
+            df_dict[cb][mutation+'_wt'] = wt
+            df_dict[cb][mutation+'_mt'] = mt
+            df_dict[cb][mutation+'_un'] = un
             df_dict[cb][mutation+'_coverage'] = coverage
 
     pd.DataFrame.from_dict(df_dict, orient='index').to_csv(outfile)
@@ -290,19 +369,19 @@ def main(args):
     sam = pysam.AlignmentFile(args.sam)
     fetch = sam.fetch(multiple_iterators=True)
 
-    mutation_df = pd.read_csv(args.mutations)#'mutations-of-interest-reduced.csv')
+    mt_df = pd.read_csv(args.mutations)#'mutations-of-interest-reduced.csv')
 
     # Get a data structure which has grouped reads into common umi's and cell barcodes
     # which indicates, for each location of interest, the count of each base pair across reads
-    mutation_dict = get_mutation_dict(fetch, sam.header, mutation_df, args.cores)
+    mt_dict = get_mutation_dict(fetch, sam.header, mt_df, args.cores)
 
     # Process the dictionary to cluster similar umi's together to account for read errors
-    cluster_mutation_dict_umis(mutation_dict)
+    cluster_mutation_dict_umis(mt_dict)
    
     # Assign mutations by replacing the dictionary of base pair counts with just the maximal base 
-    assign_umi_mutations(mutation_dict)
+    assign_umi_mutations(mt_dict)
 
-    cb_mutations = get_cb_mutations(mutation_dict)
+    cb_mutations = get_cb_mutations(mt_dict)
 
     write_cb_mutations_to_csv(cb_mutations, args.output)
 
