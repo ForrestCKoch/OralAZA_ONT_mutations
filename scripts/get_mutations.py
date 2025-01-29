@@ -20,7 +20,7 @@ def build_parser():
     Construct an argument parser
     """
     parser = argparse.ArgumentParser(
-            prog='get_consensus.py',
+            prog='get_mutations.py',
             description='Generates a consensus read from unique barcodes',
             epilog='Written by Forrest C. Koch (forrest.c.koch@gmail.com) 2024')
 
@@ -73,7 +73,7 @@ def get_mutations(read, mt_df):
         
         full_ref_pos = read.get_reference_positions(full_length=True)
         ref_pos = read.get_reference_positions(full_length=False)
-        mt_pos = int(row['mut2__hg38'].split(':')[1].split('_')[0])
+        mt_pos = int(row['mut2__hg38'].split(':')[1].split('_')[0]) - 1
         mt_desc = row['mut2__hg38'].split('_')[1]
         target_idx = get_index(mt_pos, ref_pos)
         if target_idx is None:
@@ -82,7 +82,7 @@ def get_mutations(read, mt_df):
 
         # If we reach this point, match has been found, increment that BP
         mt_status[row['mut2__hg38']] = assign_mutation_status(\
-                sequence = read.get_forward_sequence(), \
+                sequence = read.query_sequence, \
                 positions = full_ref_pos, \
                 mt_pos = mt_pos, \
                 mt_desc = mt_desc)

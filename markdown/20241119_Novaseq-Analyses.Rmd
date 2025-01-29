@@ -1,0 +1,187 @@
+---
+title: "Novaseq Analyses"
+author: "Forrest Koch"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(dplyr)
+library(magrittr)
+library(tidyr)
+library(tibble)
+library(pheatmap)
+library(ggplot2)
+library(ComplexHeatmap)
+library(pals)
+library(gridExtra)
+library(edgeR)
+#library(rtracklayer)
+library(DT)
+library(parallel)
+library(pbapply)
+library(MASS)
+library(lme4)
+library(ComplexUpset)
+library(uwot)
+library(matrixStats)
+library(viridis)
+library(viridisLite)
+#cl <- makeCluster(20)
+
+named.vector <- function(v, n){
+    r <- v
+    names(r) <- n
+    r
+}
+```
+
+```{r}
+empty.wells <- read.csv('../data/novaseq_metadata/empty_wells.csv')
+index.data <- read.csv('../data/novaseq_metadata/index_data.csv')
+tagementation.layout <- read.csv('../data/novaseq_metadata/tagmentation_layout.csv')
+```
+
+```{r}
+novaseq.counts <- read.table('../results/novaseq_featureCounts_bothMatch_countReadPairs_geneName.txt', header=T, skip=1)[,-c(2:6)] |> tibble::column_to_rownames('Geneid') |> as.matrix()
+
+novaseq.counts <- novaseq.counts[matrixStats::rowSums2(novaseq.counts) > 1, ]
+```
+
+```{r}
+sample.df <- data.frame(id=stringr::str_extract(colnames(novaseq.counts), 'Plate_[0-9]+_[A-Z][0-9]+')) |> left_join(tagementation.layout |> dplyr::mutate(id=paste0(tag_plate, '_', location)), by='id')
+
+empty.wells %<>% dplyr::mutate(id=paste0(tag_plate, '_', location))
+sample.df %<>% dplyr::mutate(empty_well=id %in% empty.wells$id)
+
+design <- model.matrix(~tag_plate+timepoint, data=sample.df)
+
+novaseq.dgelist <- edgeR::DGEList(novaseq.counts, samples=sample.df, remove.zeros=T) |> edgeR::calcNormFactors() |> edgeR::estimateCommonDisp(design)
+```
+
+```{r}
+genes.to.keep <- edgeR::filterByExpr(novaseq.dgelist, design=design, min.count=5, min.total.count=10, large.n=5, min.prop=0.125)
+
+#novaseq.filtered <- novaseq.dgelist[genes.to.keep, -c( which(is.na(sample.df$PID))), keep.lib.size=T]
+novaseq.filtered <- novaseq.dgelist[genes.to.keep, , keep.lib.size=T]
+
+novaseq.de <- edgeR::glmQLFit(novaseq.filtered, design=design)
+novaseq.qlftest <- edgeR::glmQLFTest(novaseq.de, coef=12)
+```
+
+```{r}
+results <- data.frame(novaseq.qlftest) |> tibble::rownames_to_column('gene.name')
+
+results$negLogPval <- -log10(results$PValue)
+
+ggplot(results, aes(x=logFC, y=negLogPval, label=gene.name)) +
+  geom_point() +
+  theme_minimal() +
+  labs(title="Volcano Plot RNA Seq: C7D1 vs C1D1",
+       x="Log2 Fold Change",
+       y="-Log10 P-value")
+```
+
+```{r}
+
+#write.csv(sample.df, '../apps/NovaseqUMAPS/sample-df.csv', row.names=F)
+```
+
+# Number of Genes Detected Per Plate
+
+## Total
+```{r}
+genes.per.plate <- (novaseq.filtered$counts>0) |> t() |> data.frame() |> 
+  tibble::rownames_to_column() |>
+  dplyr::mutate(id=stringr::str_extract(rowname, 'Plate_[0-9]+_[A-Z][0-9]+'),
+                is.empty=id %in% empty.wells$id,
+                tag_plate=stringr::str_extract(rowname, 'Plate_[0-9]+')
+                ) |>
+  dplyr::select(-c('rowname', 'id')) |> dplyr::group_by(tag_plate, is.empty) |>
+  dplyr::group_map(.f=\(.x, ...){
+    meta <- .x |> dplyr::select(c('tag_plate', 'is.empty'))
+    tag_plate <- meta$tag_plate[1]
+    is.empty <- meta$is.empty[1]
+    count.mat <- .x |> dplyr::select(-c('tag_plate', 'is.empty'))
+    total = sum(matrixStats::colSums2(as.matrix(count.mat))>0)
+    data.frame(tag_plate=tag_plate, empty.well=is.empty, n.genes=total)
+  },.keep=T) |> dplyr::bind_rows()
+```
+
+```{r}
+ggplot(genes.per.plate, aes(x=empty.well, y=n.genes)) + geom_boxplot() + 
+  geom_point(position=position_jitter()) + scale_y_log10() +
+  ggtitle('Genes per plate with count > 0')
+```
+
+## Average
+```{r}
+avg.genes.per.plate <- (novaseq.filtered$counts>0) |> t() |> data.frame() |> 
+  tibble::rownames_to_column() |>
+  dplyr::mutate(id=stringr::str_extract(rowname, 'Plate_[0-9]+_[A-Z][0-9]+'),
+                is.empty=id %in% empty.wells$id,
+                tag_plate=stringr::str_extract(rowname, 'Plate_[0-9]+')
+                ) |>
+  dplyr::select(-c('rowname', 'id')) |> dplyr::group_by(tag_plate, is.empty) |>
+  dplyr::group_map(.f=\(.x, ...){
+    meta <- .x |> dplyr::select(c('tag_plate', 'is.empty'))
+    tag_plate <- meta$tag_plate[1]
+    is.empty <- meta$is.empty[1]
+    count.mat <- .x |> dplyr::select(-c('tag_plate', 'is.empty'))
+    total = mean(matrixStats::rowSums2(as.matrix(count.mat)>0))
+    data.frame(tag_plate=tag_plate, empty.well=is.empty, n.genes=total)
+  },.keep=T) |> dplyr::bind_rows()
+```
+
+```{r}
+ggplot(avg.genes.per.plate, aes(x=empty.well, y=n.genes)) + geom_boxplot() + 
+  geom_point(position=position_jitter()) + scale_y_log10() + ggtitle('Average genes per sample with count > 0')
+```
+
+# Plate Plots
+
+## Total Counts
+```{r}
+counts.per.sample <- matrixStats::colSums2(novaseq.dgelist$counts) %>% data.frame(count=.) |> 
+  tibble::rownames_to_column() |>
+  dplyr::mutate(id=stringr::str_extract(rowname, 'Plate_[0-9]+_[A-Z][0-9]+'),
+                tag_plate=stringr::str_extract(rowname, 'Plate_[0-9]+'),
+                is.empty=id %in% empty.wells$id,
+                location=gsub('Plate_[0-9]+_', '', id),
+                column=gsub('[0-9]+', '', location),
+                row=gsub('[A-Z]', '', location)
+                ) |>
+  dplyr::select(-c('rowname', 'id')) |> dplyr::group_by(tag_plate) |>
+  dplyr::group_map(.f=\(.x, ...){
+    .x %<>% dplyr::mutate(row=factor(row, levels=paste0(c(1:12))))
+    # p <- ggplot(.x, aes(x=column, y=row, fill=log1p(count))) + geom_tile() +
+    #   scale_fill_viridis() + ggtitle(.x$tag_plate[1])
+    p <- ggplot(.x, aes(x=column, y=row, fill=log1p(count), color=is.empty)) + geom_tile(linewidth=1) +
+      scale_colour_manual(values=c('TRUE'='red', 'FALSE'='black')) + scale_fill_viridis(limits=c(0,13)) + ggtitle(.x$tag_plate[1])
+    print(p)
+  },.keep=T) 
+```
+
+## Genes Per Sample 
+```{r}
+counts.per.sample <- matrixStats::colSums2(novaseq.filtered$counts>0) %>% data.frame(count=.) |> 
+  tibble::rownames_to_column() |>
+  dplyr::mutate(id=stringr::str_extract(rowname, 'Plate_[0-9]+_[A-Z][0-9]+'),
+                tag_plate=stringr::str_extract(rowname, 'Plate_[0-9]+'),
+                is.empty=id %in% empty.wells$id,
+                location=gsub('Plate_[0-9]+_', '', id),
+                column=gsub('[0-9]+', '', location),
+                row=gsub('[A-Z]', '', location)
+                ) |>
+  dplyr::select(-c('rowname', 'id')) |> dplyr::group_by(tag_plate) |>
+  dplyr::group_map(.f=\(.x, ...){
+    .x %<>% dplyr::mutate(row=factor(row, levels=paste0(c(1:12))))
+    p <- ggplot(.x, aes(x=column, y=row, fill=log1p(count), color=is.empty)) + geom_tile(linewidth=1) +
+      scale_colour_manual(values=c('TRUE'='red', 'FALSE'='black')) + scale_fill_viridis(limits=c(0, 7)) + ggtitle(.x$tag_plate[1])
+    print(p)
+  },.keep=T) 
+```

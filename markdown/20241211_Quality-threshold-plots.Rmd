@@ -1,0 +1,104 @@
+---
+title: "Quality Threshold Plots"
+author: "Forrest Koch"
+date: "2024-12-10"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(dplyr)
+library(magrittr)
+library(tidyr)
+library(tibble)
+library(pheatmap)
+library(ggplot2)
+library(ComplexHeatmap)
+library(pals)
+library(gridExtra)
+library(edgeR)
+#library(rtracklayer)
+library(DT)
+library(parallel)
+library(pbapply)
+library(MASS)
+library(lme4)
+library(ComplexUpset)
+library(uwot)
+library(matrixStats)
+library(viridis)
+library(viridisLite)
+#cl <- makeCluster(20)
+
+named.vector <- function(v, n){
+    r <- v
+    names(r) <- n
+    r
+}
+```
+
+```{r}
+# Load in data
+result.dir <- '../results/mutations-called-cb-only-with-quality-threshold_v2'
+result.files <- list.files(result.dir)
+spreadsheets <- lapply(result.files, \(.f){ read.csv(file.path(result.dir, .f))})
+```
+
+```{r}
+# Work out the mutations we want to put together a plot for
+mutations <- (gsub('_[a-z]+(_qual)*$', '', names(spreadsheets[[1]])) |> unique())[-1]
+
+# Get a list of mutations which are actually detected/covered
+to.keep <- lapply(mutations, \(.m){
+  (lapply(spreadsheets, \(.s) sum(.s[paste0(.m,'_coverage')])) |> unlist() |> sum()) > 0
+}) |> unlist()
+
+detected.mutations <- mutations[to.keep]
+```
+
+```{r}
+threshold.stats <- lapply(detected.mutations, \(.m){
+  .x <- lapply(spreadsheets, \(.s){
+    coverage <- sum(.s[paste0(.m,'_coverage')])
+    junk <- .s[paste0(.m, c('_mt', '_wt', '_un'))] |> apply(MARGIN=1, FUN=min) |> sum()
+    names(junk) <- c()
+    c(coverage=coverage, junk=junk)
+  }) |> dplyr::bind_rows() |> dplyr::mutate(pool=stringr::str_split(result.files, '_') |> sapply(FUN="[", 4),
+                                            threshold=stringr::str_split(result.files, '_',) |> 
+                                              sapply(FUN="[", 5) %>% 
+                                              gsub('.*-', '', .) %>% 
+                                              gsub('.csv', '', .) |> 
+                                              as.numeric(),
+                                            mutation=.m) |>
+    dplyr::group_by(threshold, mutation) %>% dplyr::summarize(junk=sum(junk), coverage=sum(coverage), .groups='drop')
+})
+```
+
+```{r}
+scatter.plots <- lapply(threshold.stats, \(.df){
+  .df2 <- .df %>% dplyr::group_by(threshold) %>% dplyr::summarize(junk=sum(junk), coverage=sum(coverage))
+  ggplot(.df2, aes(x=junk, y=coverage, colour=threshold)) + 
+    geom_point()  +
+    scale_y_continuous(transform='log1p') + scale_x_continuous(transform='log1p', limits=c(0,max(.df2$junk))) +
+    viridis::scale_color_viridis() + xlab('Junk Counts') + ylab('Site Coverage') +
+    ggtitle(.df$mutation[1])
+})
+```
+
+# Plots
+
+```{r}
+#lapply(scatter.plots)
+.tmp <- lapply(scatter.plots, \(.p) knitr::knit_print(.p))
+```
+
+# Tables
+
+```{r, results='asis'}
+names(threshold.stats) <- detected.mutations
+null.out <- lapply(threshold.stats, \(.x){
+  #.x |> dplyr::select(-c('mutation')) |> kableExtra::kable(caption=.x$mutation[1]) |> kableExtra::kable_classic()
+  .x |> dplyr::select(-c('mutation')) |> flextable::flextable() |> flextable::set_caption(.x$mutation[1]) |> knitr::knit_print() |> cat()
+})
+```

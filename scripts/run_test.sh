@@ -15,5 +15,5 @@ cd $PBS_O_WORKDIR
 
 sam="data/nanoranger_output/PGXXXF240300_pass_barcode07/PGXXXF240300_pass_barcode07_genome_tagged.bam"
 mutations="data/mutations-of-interest-reduced.csv"
-output="test.csv"
+output="test-new.csv"
 python3.10 scripts/get_mutations.py -s $sam -m $mutations -o $output -c $NCPU

@@ -4,9 +4,9 @@
 #PBS -l walltime=2:00:00
 #PBS -M forrest.koch@unsw.edu.au
 #PBS -m ae
-#PBS -o logs/nanoranger-jobs
+#PBS -o logs/nanoranger-jobs-v2
 #PBS -j oe
-#PBS -J 1-50%1
+#PBS -J 1-4
 
 NCPU=8
 module load python/3.11
@@ -24,19 +24,22 @@ cd $PBS_O_WORKDIR
 # Get the job identifier.
 # to be run ...
 i=$PBS_ARRAY_INDEX
-#i=42
-#i=43
-#i=47
 
-FASTQ=$(find data/base_called -type f -name '*.fastq.gz' | tail -n+$i | head -n1)
+#FASTQ=$(find data/base_called -type f -name '*.fastq.gz' | tail -n+$i | head -n1)
+FASTQ="data/base_called/PGXXXF240300/PGXXXF240300_pass_barcode0$(($i + 4)).fastq.gz"
+
 SAMPLE_NAME="$(echo $FASTQ | rev | cut -d'/' -f1 | rev | cut -d'.' -f1)"
-OUT_DIR="data/nanoranger_output/$SAMPLE_NAME"
+
+OUT_DIR="data/nanoranger_output_v2/$SAMPLE_NAME"
 TRANS_REF="data/transcript_reference.fa.gz"
-BARCODES="data/barcodes.txt.gz"
 
 mkdir -p $OUT_DIR
-mkdir -p logs/nanoranger-pipeline
-mkdir -p logs/nanoranger-jobs
+mkdir -p logs/nanoranger-pipeline-v2
+mkdir -p logs/nanoranger-jobs-v2
+
+BARCODES="$OUT_DIR/barcodes.txt.gz"
+
+zcat data/HSC_obs.csv.gz | grep "HSPC_pool$i" | cut -d'-' -f1 | pigz -9 > $BARCODES
 
 
 python3.11 $HOME/local/builds/nanoranger/pipeline.py \
@@ -47,5 +50,5 @@ python3.11 $HOME/local/builds/nanoranger/pipeline.py \
     --mode 5p10XGEX \
     --trns_ref $TRANS_REF \
     --genome_ref $GENOME_REF \
-    --barcodes $BARCODES >> logs/nanoranger-pipeline/${SAMPLE_NAME}.log 2>&1
+    --barcodes $BARCODES >> logs/nanoranger-pipeline-v2/${SAMPLE_NAME}.log 2>&1
 

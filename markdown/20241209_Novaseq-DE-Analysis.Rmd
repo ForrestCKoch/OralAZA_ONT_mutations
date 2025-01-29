@@ -1,0 +1,415 @@
+---
+title: "Novaseq DE Analysis"
+author: "Forrest Koch"
+date: "2024-12-17"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(dplyr)
+library(magrittr)
+library(tidyr)
+library(tibble)
+library(pheatmap)
+library(ggplot2)
+library(ComplexHeatmap)
+library(pals)
+library(gridExtra)
+library(edgeR)
+#library(rtracklayer)
+library(DT)
+library(parallel)
+library(pbapply)
+library(MASS)
+library(lme4)
+library(ComplexUpset)
+library(uwot)
+library(matrixStats)
+library(viridis)
+library(viridisLite)
+library('org.Hs.eg.db')
+library(uwot)
+#cl <- makeCluster(20)
+
+named.vector <- function(v, n){
+    r <- v
+    names(r) <- n
+    r
+}
+```
+
+```{r load.gtf}
+gtf <- rtracklayer::import('/data/Projects/VafaeeLab/HumanGenome/genome/gencode.v44.annotation.gtf.gz', format='gtf')
+gtf.df <- data.frame(gene_id=gtf$gene_id, gene_name=gtf$gene_name, gene_type=gtf$gene_type) %>% distinct
+gtf.df.protein.coding <- dplyr::filter(gtf.df, gene_type=='protein_coding')
+```
+
+```{r}
+empty.wells <- read.csv('../data/novaseq_metadata/empty_wells.csv')
+index.data <- read.csv('../data/novaseq_metadata/index_data.csv')
+tagmentation.layout <- read.csv('../data/novaseq_metadata/tagmentation_layout.csv')
+all.metadata <- read.csv('../data/novaseq_metadata/all_data_for_forrest.csv')
+```
+
+```{r}
+novaseq.counts <- read.table('../results/novaseq_featureCounts_bothMatch_countReadPairs_geneName.txt.gz', header=T, skip=1)[,-c(2:6)] |> tibble::column_to_rownames('Geneid') |> as.matrix()
+
+novaseq.counts <- novaseq.counts[matrixStats::rowSums2(novaseq.counts) > 1, ]
+```
+
+```{r}
+sample.df <- data.frame(id=stringr::str_extract(colnames(novaseq.counts), 'Plate_[0-9]+_[A-Z][0-9]+')) |> 
+  left_join(all.metadata|> dplyr::mutate(id=paste0(tag_plate, '_', location)), by='id') 
+
+empty.wells %<>% dplyr::mutate(id=paste0(tag_plate, '_', location))
+sample.df %<>% dplyr::mutate(empty_well=id %in% empty.wells$id,
+                             timepoint=ifelse(timepoint=='C1_D8', 'C1_D1', timepoint),
+                             cell_type=factor(cell_type, levels=c('CD90_low', 'CD90_high')))
+                             
+   #dplyr::left_join(index.data |> dplyr::select(c('PID_timepoint', 'Well.Number', 'cell_type')), by=c('PID_timepoint'='PID_timepoint', 'location'='Well.Number'))
+
+to.exclude <- (sample.df$timepoint=='HSA'|sample.df$empty_well|is.na(sample.df$cell_type))
+#to.exclude <- with(sample.df, empty_well|is.na(cell_type)|((timepoint=='HSA')&(tag_plate=='Plate_9')))
+to.exclude %<>% ifelse(is.na(.), TRUE, .)
+
+#sample.df.alt <- sample.df |> dplyr::mutate(timepoint==ifelse(timepoint=='HSA', ''))
+design <- model.matrix(~tag_plate+timepoint+cell_type+PID, data=sample.df[!to.exclude,])
+
+novaseq.dgelist <- edgeR::DGEList(novaseq.counts[,!to.exclude], samples=sample.df[!to.exclude,], remove.zeros=T) 
+```
+
+```{r}
+genes.to.keep <- edgeR::filterByExpr(novaseq.dgelist, design=design, min.count=5, min.total.count=10, large.n=5, min.prop=0.125)
+
+#novaseq.filtered <- novaseq.dgelist[genes.to.keep, -c( which(is.na(sample.df$PID))), keep.lib.size=T]
+novaseq.filtered <- novaseq.dgelist[genes.to.keep, , keep.lib.size=F] |> edgeR::calcNormFactors() |> edgeR::estimateDisp(design)
+
+novaseq.de <- edgeR::glmQLFit(novaseq.filtered, design=design)
+#qlftest <- edgeR::glmQLFTest(novaseq.de, coef=c('timepointC7_D1'))
+#saveRDS(qlftest, 'qlftest.rds')
+```
+
+# Counts per cell (post gene filtration)
+```{r}
+lcounts.per.sample <- data.frame(log_counts = log10(novaseq.filtered$counts  |> matrixStats::colSums2())) |> cbind(novaseq.filtered$samples)
+ggplot(lcounts.per.sample, aes(x=log_counts, colour=tag_plate)) + geom_density() + ggtitle('Log Count per Well Distribution by Plate')
+```
+
+# DE Volcano Plots
+
+The design matrix takes the form of `~tag_plate+timepoint+cell_type+PID`
+
+## C7D1 Vs C1D1/C1D8
+```{r}
+qlftest.c7d1 <- edgeR::glmQLFTest(novaseq.de, coef=c('timepointC7_D1'))
+results.c7d1 <- data.frame(qlftest.c7d1) |> tibble::rownames_to_column('gene.name') |>
+  dplyr::mutate(fdr=p.adjust(PValue, method='fdr'),
+                label=ifelse(fdr<0.1, gene.name, ''),
+                colour=ifelse(fdr<0.1, ifelse(logFC>0, 'red', 'blue'),'black'))
+
+results.c7d1$negLogPval <- -log10(results.c7d1$fdr)
+
+# ggplot(results.c7d1, aes(x=logFC, y=negLogPval, label=gene.name)) +
+#   geom_point() +
+#   theme_minimal() +
+#   labs(title="Volcano Plot RNA Seq: C7D1 vs C1D1/C1D8",
+#        x="Log2 Fold Change",
+#        y="-Log10 FDR")
+ggplot(results.c7d1, aes(x=logFC, y=-log10(fdr), label=label, colour=colour)) + 
+  geom_point() + 
+  ggrepel::geom_text_repel() + 
+  scale_colour_manual(values=c('black', 'blue', 'red')) + 
+  theme_bw() +
+  theme(legend.position='none') + 
+  geom_abline(intercept=-log10(0.05), slope=0) +
+  labs(title="Volcano Plot RNA Seq: C7D1 vs C1D1/C1D8",
+       x="Log2 Fold Change",
+       y="-Log10 FDR")
+```
+
+## C12_D29 Vs C1D1/C1D8
+```{r}
+qlftest.c12d29 <- edgeR::glmQLFTest(novaseq.de, coef=c('timepointC12_D29'))
+results.c12d29 <- data.frame(qlftest.c12d29) |> tibble::rownames_to_column('gene.name') |>
+  dplyr::mutate(fdr=p.adjust(PValue, method='fdr'),
+                label=ifelse(fdr<0.1, gene.name, ''),
+                colour=ifelse(fdr<0.1, ifelse(logFC>0, 'red', 'blue'),'black'))
+
+results.c12d29$negLogPval <- -log10(results.c12d29$fdr)
+
+# ggplot(results.c12d29, aes(x=logFC, y=negLogPval, label=gene.name)) +
+#   geom_point() +
+#   theme_minimal() +
+#   labs(title="Volcano Plot RNA Seq: c12d29 vs C1D1/C1D8",
+#        x="Log2 Fold Change",
+#        y="-Log10 FDR")
+ggplot(results.c12d29, aes(x=logFC, y=-log10(fdr), label=label, colour=colour)) + 
+  geom_point() + 
+  ggrepel::geom_text_repel() + 
+  scale_colour_manual(values=c('black', 'blue', 'red')) + 
+  theme_bw() +
+  theme(legend.position='none') + 
+  geom_abline(intercept=-log10(0.05), slope=0) +
+  labs(title="Volcano Plot RNA Seq: C12D29 vs C1D1/C1D8",
+       x="Log2 Fold Change",
+       y="-Log10 FDR")
+```
+
+## CD90 High vs Low
+```{r}
+qlftest.cd90 <- edgeR::glmQLFTest(novaseq.de, coef=c('cell_typeCD90_high'))
+results.cd90 <- data.frame(qlftest.cd90) |> tibble::rownames_to_column('gene.name') |>
+  dplyr::mutate(fdr=p.adjust(PValue, method='fdr'),
+                label=ifelse(fdr<0.1, gene.name, ''),
+                colour=ifelse(fdr<0.1, ifelse(logFC>0, 'red', 'blue'),'black'))
+
+results.cd90$negLogPval <- -log10(results.cd90$fdr)
+
+# ggplot(results.cd90, aes(x=logFC, y=negLogPval, label=gene.name)) +
+#   geom_point() +
+#   theme_minimal() +
+#   labs(title="Volcano Plot RNA Seq: cd90 vs C1D1/C1D8",
+#        x="Log2 Fold Change",
+#        y="-Log10 FDR")
+ggplot(results.cd90, aes(x=logFC, y=-log10(fdr), label=label, colour=colour)) + 
+  geom_point() + 
+  ggrepel::geom_text_repel() + 
+  scale_colour_manual(values=c('black', 'blue', 'red')) + 
+  theme_bw() +
+  theme(legend.position='none') + 
+  geom_abline(intercept=-log10(0.05), slope=0) +
+  labs(title="Volcano Plot RNA Seq: CD90 High vs Low",
+       x="Log2 Fold Change",
+       y="-Log10 FDR")
+```
+
+# Table of DE Results
+
+## C7D1 vs C1D1/C1D8
+```{r}
+results.c7d1 %>% dplyr::filter(fdr < 0.1) %>% 
+  dplyr::arrange(desc(`F`)) %>%
+  dplyr::mutate_if(is.numeric, round, digits=3) %>% 
+  dplyr::select(-c('label', 'negLogPval', 'colour')) %>%
+  DT::datatable(caption='Genes with FDR < 0.1 from QLF Test for differential expression of C7D1 vs C1D1/C1D8', extensions='Buttons', options=list(dom = 'Blfrtip',
+                           buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+                           lengthMenu = list(c(10,25,50,-1),
+                                             c(10,25,50,"All"))))
+```
+
+## C12D29 vs C1D1/C1D8
+```{r}
+results.c12d29 %>% dplyr::filter(fdr < 0.1) %>% 
+  dplyr::arrange(desc(`F`)) %>%
+  dplyr::mutate_if(is.numeric, round, digits=3) %>% 
+  dplyr::select(-c('label', 'negLogPval', 'colour')) %>%
+  DT::datatable(caption='Genes with FDR < 0.1 from QLF Test for differential expression of C12D29 vs C1D1/C1D8', extensions='Buttons', options=list(dom = 'Blfrtip',
+                           buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+                           lengthMenu = list(c(10,25,50,-1),
+                                             c(10,25,50,"All"))))
+```
+
+## CD90 High vs Low
+```{r}
+results.cd90 %>% dplyr::filter(fdr < 0.1) %>% 
+  dplyr::arrange(desc(`F`)) %>%
+  dplyr::mutate_if(is.numeric, round, digits=3) %>% 
+  dplyr::select(-c('label', 'negLogPval', 'colour')) %>%
+  DT::datatable(caption='Genes with FDR < 0.1 from QLF Test for differential expression of CD90 high vs low', extensions='Buttons', options=list(dom = 'Blfrtip',
+                           buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+                           lengthMenu = list(c(10,25,50,-1),
+                                             c(10,25,50,"All"))))
+```
+
+# Pathway Analyses
+
+## C7D1 vs C1D1
+
+### KEGG 
+
+```{r}
+c7d1.ids <- mapIds(org.Hs.eg.db, rownames(qlftest.c7d1), 'ENTREZID', 'SYMBOL')
+c7d1.kegga <- kegga(qlftest.c7d1, geneid=c7d1.ids) |> 
+  dplyr::mutate(pmin=pmin(P.Up, P.Down)) |> 
+  dplyr::filter(pmin<0.05) |>
+  dplyr::arrange(pmin)#|> topKEGG() 
+
+c7d1.kegga |> dplyr::mutate_if(is.numeric, round, digits=3) |> 
+  DT::datatable(caption='Top KEGG pathways for C7D1 vs C1D1', extensions='Buttons', options=list(dom = 'Blfrtip',
+                           buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+                           lengthMenu = list(c(10,25,50,-1),
+                                             c(10,25,50,"All"))))
+```
+
+### GO
+
+```{r}
+c7d1.ids <- mapIds(org.Hs.eg.db, rownames(qlftest.c7d1), 'ENTREZID', 'SYMBOL')
+c7d1.goana <- goana(qlftest.c7d1, geneid=c7d1.ids)  |> 
+  dplyr::mutate(pmin=pmin(P.Up, P.Down)) |> 
+  dplyr::filter(pmin<0.05) |>
+  dplyr::arrange(pmin) #|> topGO() 
+
+c7d1.goana |> dplyr::mutate_if(is.numeric, round, digits=3) |> 
+  DT::datatable(caption='Top GO pathways for C7D1 vs C1D1', extensions='Buttons', options=list(dom = 'Blfrtip',
+                           buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+                           lengthMenu = list(c(10,25,50,-1),
+                                             c(10,25,50,"All"))))
+```
+## CD90 high vs low
+
+### KEGG
+
+```{r}
+cd90.ids <- mapIds(org.Hs.eg.db, rownames(qlftest.cd90), 'ENTREZID', 'SYMBOL')
+cd90.kegga <- kegga(qlftest.cd90, geneid=cd90.ids) |> 
+  dplyr::mutate(pmin=pmin(P.Up, P.Down)) |> 
+  dplyr::filter(pmin<0.05) |>
+  dplyr::arrange(pmin)#|> topKEGG() 
+
+cd90.kegga |> dplyr::mutate_if(is.numeric, round, digits=3) |> 
+  DT::datatable(caption='Top KEGG pathways for CD90 high vs low', extensions='Buttons', options=list(dom = 'Blfrtip',
+                           buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+                           lengthMenu = list(c(10,25,50,-1),
+                                             c(10,25,50,"All"))))
+```
+
+### GO
+
+```{r}
+cd90.ids <- mapIds(org.Hs.eg.db, rownames(qlftest.cd90), 'ENTREZID', 'SYMBOL')
+cd90.goana <- goana(qlftest.cd90, geneid=cd90.ids)  |> 
+  dplyr::mutate(pmin=pmin(P.Up, P.Down)) |> 
+  dplyr::filter(pmin<0.05) |>
+  dplyr::arrange(pmin) #|> topGO() 
+
+cd90.goana |> dplyr::mutate_if(is.numeric, round, digits=3) |> 
+  DT::datatable(caption='Top GO pathways for CD90 high vs low', extensions='Buttons', options=list(dom = 'Blfrtip',
+                           buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+                           lengthMenu = list(c(10,25,50,-1),
+                                             c(10,25,50,"All"))))
+```
+
+# UMAPs
+
+## By Timepoint
+```{r}
+umap.df <- uwot::umap2(novaseq.filtered |> edgeR::cpm(log=TRUE) |> t() |> scale()) |> data.frame()
+ggplot(umap.df |> dplyr::mutate(group=novaseq.filtered$samples$timepoint), aes(x=X1, y=X2, colour=group)) + geom_point()
+```
+
+## By Cell Type
+```{r}
+ggplot(umap.df |> dplyr::mutate(group=novaseq.filtered$samples$cell_type), aes(x=X1, y=X2, colour=group)) + geom_point()
+```
+
+## By Plate
+```{r}
+ggplot(umap.df |> dplyr::mutate(group=novaseq.filtered$samples$tag_plate), aes(x=X1, y=X2, colour=group)) + geom_point()
+```
+
+## By PID
+```{r}
+ggplot(umap.df |> dplyr::mutate(group=novaseq.filtered$samples$PID), aes(x=X1, y=X2, colour=group)) + geom_point()
+```
+
+# Cancer vs HSA
+
+```{r}
+baseline.sample.df <-  sample.df |> dplyr::filter(timepoint %in% c('HSA', 'C1_D1'))     
+   #dplyr::left_join(index.data |> dplyr::select(c('PID_timepoint', 'Well.Number', 'cell_type')), by=c('PID_timepoint'='PID_timepoint', 'location'='Well.Number'))
+
+#to.exclude <- (sample.df$timepoint=='HSA'|sample.df$empty_well|is.na(sample.df$cell_type))
+baseline.to.exclude <- with(baseline.sample.df, empty_well|is.na(cell_type)|PID=='HSA2019')
+baseline.to.exclude %<>% ifelse(is.na(.), TRUE, .)
+
+#sample.df.alt <- sample.df |> dplyr::mutate(timepoint==ifelse(timepoint=='HSA', ''))
+baseline.design <- model.matrix(~timepoint+cell_type, data=baseline.sample.df[!baseline.to.exclude,])
+
+baseline.novaseq.dgelist <- edgeR::DGEList(novaseq.counts[,with(sample.df, timepoint %in% c('HSA', "C1_D1"))][,!baseline.to.exclude], samples=baseline.sample.df[!baseline.to.exclude,], remove.zeros=T) 
+```
+
+```{r}
+baseline.genes.to.keep <- edgeR::filterByExpr(baseline.novaseq.dgelist, design=baseline.design, min.count=5, min.total.count=10, large.n=5, min.prop=0.125)
+
+#novaseq.filtered <- novaseq.dgelist[genes.to.keep, -c( which(is.na(sample.df$PID))), keep.lib.size=T]
+baseline.novaseq.filtered <- baseline.novaseq.dgelist[baseline.genes.to.keep, , keep.lib.size=F] |> edgeR::calcNormFactors() |> edgeR::estimateDisp(baseline.design)
+
+baseline.novaseq.de <- edgeR::glmQLFit(baseline.novaseq.filtered, design=baseline.design)
+#qlftest <- edgeR::glmQLFTest(novaseq.de, coef=c('timepointC7_D1'))
+#saveRDS(qlftest, 'qlftest.rds')
+```
+
+## Volcano Plot
+
+```{r}
+baseline.qlftest <- edgeR::glmQLFTest(baseline.novaseq.de, coef=c('timepointHSA'))
+baseline.results <- data.frame(baseline.qlftest) |> tibble::rownames_to_column('gene.name') |>
+  dplyr::mutate(fdr=p.adjust(PValue, method='fdr'),
+                label=ifelse(fdr<0.1, gene.name, ''),
+                logFC=-logFC,
+                colour=ifelse(fdr<0.1, ifelse(logFC>0, 'red', 'blue'),'black'))
+
+baseline.results$negLogPval <- -log10(baseline.results$fdr)
+
+ggplot(baseline.results, aes(x=logFC, y=-log10(fdr), label=label, colour=colour)) + 
+  geom_point() + 
+  ggrepel::geom_text_repel() + 
+  scale_colour_manual(values=c('black', 'blue', 'red')) + 
+  theme_bw() +
+  theme(legend.position='none') + 
+  geom_abline(intercept=-log10(0.05), slope=0) +
+  labs(title="Volcano Plot RNA Seq: Cancer vs HSA",
+       x="Log2 Fold Change",
+       y="-Log10 FDR")
+```
+
+## Table of DE Results
+
+```{r}
+baseline.results %>% dplyr::filter(fdr < 0.1) %>% 
+  dplyr::arrange(desc(`F`)) %>%
+  dplyr::mutate_if(is.numeric, round, digits=3) %>% 
+  dplyr::select(-c('label', 'negLogPval', 'colour')) %>%
+  DT::datatable(caption='Genes with FDR < 0.1 from QLF Test for differential expression of Disease vs Healthy.', extensions='Buttons', options=list(dom = 'Blfrtip',
+                           buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+                           lengthMenu = list(c(10,25,50,-1),
+                                             c(10,25,50,"All"))))
+```
+
+## KEGG 
+
+```{r}
+baseline.ids <- mapIds(org.Hs.eg.db, rownames(baseline.qlftest), 'ENTREZID', 'SYMBOL')
+baseline.kegga <- kegga(baseline.qlftest, geneid=baseline.ids) |> 
+  dplyr::mutate(pmin=pmin(P.Up, P.Down)) |> 
+  dplyr::filter(pmin<0.05) |>
+  dplyr::arrange(pmin)#|> topKEGG() 
+
+baseline.kegga |> dplyr::mutate_if(is.numeric, round, digits=3) |> 
+  DT::datatable(caption='Top KEGG pathways for baseline vs C1D1', extensions='Buttons', options=list(dom = 'Blfrtip',
+                           buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+                           lengthMenu = list(c(10,25,50,-1),
+                                             c(10,25,50,"All"))))
+```
+
+## GO
+
+```{r}
+baseline.ids <- mapIds(org.Hs.eg.db, rownames(baseline.qlftest), 'ENTREZID', 'SYMBOL')
+baseline.goana <- goana(baseline.qlftest, geneid=baseline.ids)  |> 
+  dplyr::mutate(pmin=pmin(P.Up, P.Down)) |> 
+  dplyr::filter(pmin<0.05) |>
+  dplyr::arrange(pmin) #|> topGO() 
+
+baseline.goana |> dplyr::mutate_if(is.numeric, round, digits=3) |> 
+  DT::datatable(caption='Top GO pathways for baseline vs C1D1', extensions='Buttons', options=list(dom = 'Blfrtip',
+                           buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+                           lengthMenu = list(c(10,25,50,-1),
+                                             c(10,25,50,"All"))))
+```
